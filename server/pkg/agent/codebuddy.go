@@ -3,53 +3,46 @@ package agent
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
 )
 
-// codebuddyBackend implements Backend by spawning the CodeBuddy CLI
-// (a Claude Code fork) with --output-format stream-json.
-// It mirrors claude.go's execution model: concurrent stdin/stdout to
-// avoid pipe deadlocks, open stdin for control_request auto-approval,
-// and runContext for zero-timeout = no-deadline semantics.
+// codebuddyBlockedArgs are flags hardcoded by the daemon that must not be
+// overridden by user-configured custom_args. `--acp` is the protocol
+// subcommand that drives the ACP JSON-RPC transport for CodeBuddy Code
+// CLI; overriding it would break the daemon↔CodeBuddy communication
+// contract.
+var codebuddyBlockedArgs = map[string]blockedArgMode{
+	"--acp": blockedStandalone,
+}
+
+// codebuddyBackend implements Backend by spawning `codebuddy --acp` and
+// communicating via the ACP (Agent Client Protocol) JSON-RPC 2.0 over
+// stdin/stdout.
+//
+// CodeBuddy Code (a Claude Code fork) supports ACP out of the box via the
+// `codebuddy --acp` flag (see https://www.codebuddy.cn/docs/cli/acp). We
+// reuse the existing hermesClient ACP transport since both runtimes speak
+// the same protocol — only the binary, env, root-level CLI flags, and
+// tool-name extraction differ.
 type codebuddyBackend struct {
 	cfg Config
 }
 
-// codebuddyBlockedArgs are flags hardcoded by the daemon that must not be
-// overridden by user-configured custom_args. Overriding these would break
-// the daemon↔codebuddy communication protocol.
-var codebuddyBlockedArgs = map[string]blockedArgMode{
-	"-p":                blockedStandalone, // non-interactive mode
-	"--output-format":   blockedWithValue,  // stream-json protocol
-	"--input-format":    blockedWithValue,  // stream-json protocol
-	"--permission-mode": blockedWithValue,  // bypassPermissions for autonomous operation
-	"--mcp-config":      blockedWithValue,  // set by daemon from agent.mcp_config
-	// `--effort` is owned by the per-agent thinking_level picker so a
-	// user-supplied custom_arg cannot silently outvote it.
-	"--effort": blockedWithValue,
-}
-
+// buildCodebuddyArgs assembles the argv for `codebuddy`. `--acp` switches
+// the CLI into ACP server mode; the remaining root-level flags
+// (`--effort`, `--max-turns`, `--append-system-prompt`) coexist with
+// `--acp` and configure the session startup. Model switching, resume,
+// and MCP config are NOT passed here — they flow through ACP
+// `session/set_model`, `session/resume`, and `session/new.mcpServers`
+// respectively, matching how kimiBackend / hermesBackend work.
 func buildCodebuddyArgs(opts ExecOptions, logger *slog.Logger) []string {
-	args := []string{
-		"-p",
-		"--output-format", "stream-json",
-		"--input-format", "stream-json",
-		"--verbose",
-		"--strict-mcp-config",
-		"--permission-mode", "bypassPermissions",
-		"--disallowedTools", "AskUserQuestion",
-	}
-	if opts.Model != "" {
-		args = append(args, "--model", opts.Model)
-	}
+	args := []string{"--acp"}
 	if opts.ThinkingLevel != "" {
 		args = append(args, "--effort", opts.ThinkingLevel)
 	}
@@ -59,10 +52,6 @@ func buildCodebuddyArgs(opts ExecOptions, logger *slog.Logger) []string {
 	if opts.SystemPrompt != "" {
 		args = append(args, "--append-system-prompt", opts.SystemPrompt)
 	}
-	if opts.ResumeSessionID != "" {
-		args = append(args, "--resume", opts.ResumeSessionID)
-	}
-	args = append(args, filterCustomArgs(opts.ExtraArgs, codebuddyBlockedArgs, logger)...)
 	args = append(args, filterCustomArgs(opts.CustomArgs, codebuddyBlockedArgs, logger)...)
 	return args
 }
@@ -76,36 +65,25 @@ func (b *codebuddyBackend) Execute(ctx context.Context, prompt string, opts Exec
 		return nil, fmt.Errorf("codebuddy executable not found at %q: %w", execPath, err)
 	}
 
+	// Translate the agent's mcp_config (Claude-style object of objects)
+	// into the array shape ACP `session/new` expects. Fail closed on
+	// malformed JSON so the launch surfaces the real error instead of
+	// silently dropping all MCP servers.
+	mcpServers, err := buildACPMcpServers(opts.McpConfig, b.cfg.Logger)
+	if err != nil {
+		return nil, fmt.Errorf("codebuddy: invalid mcp_config: %w", err)
+	}
+
 	timeout := opts.Timeout
 	runCtx, cancel := runContext(ctx, timeout)
 
-	args := buildCodebuddyArgs(opts, b.cfg.Logger)
-
-	// If the caller provided an MCP config, write it to a temp file and pass
-	// --mcp-config <path> so the agent uses a controlled set of MCP servers.
-	var mcpConfigPath string
-	var mcpFileCleanup func()
-	if len(opts.McpConfig) > 0 {
-		path, err := writeMcpConfigToTemp(opts.McpConfig)
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-		mcpConfigPath = path
-		mcpFileCleanup = func() { os.Remove(mcpConfigPath) }
-		args = append(args, "--mcp-config", mcpConfigPath)
-	}
-	// Clean up the temp file if we return before the goroutine takes ownership.
-	defer func() {
-		if mcpFileCleanup != nil {
-			mcpFileCleanup()
-		}
-	}()
-
-	cmd := exec.CommandContext(runCtx, execPath, args...)
+	// `codebuddy --acp` does not honour --permission-mode / --yolo; the
+	// daemon auto-approves in hermesClient.handleAgentRequest by replying
+	// "approve_for_session" to every session/request_permission request.
+	codebuddyArgs := buildCodebuddyArgs(opts, b.cfg.Logger)
+	cmd := exec.CommandContext(runCtx, execPath, codebuddyArgs...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
-	cmd.WaitDelay = 10 * time.Second
+	b.cfg.Logger.Info("agent command", "exec", execPath, "args", codebuddyArgs)
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
@@ -121,401 +99,361 @@ func (b *codebuddyBackend) Execute(ctx context.Context, prompt string, opts Exec
 		cancel()
 		return nil, fmt.Errorf("codebuddy stdin pipe: %w", err)
 	}
-	var closeStdinOnce sync.Once
-	closeStdin := func() { closeStdinOnce.Do(func() { _ = stdin.Close() }) }
-
-	stderrBuf := newStderrTail(newLogWriter(b.cfg.Logger, "[codebuddy:stderr] "), agentStderrTailBytes)
-	cmd.Stderr = stderrBuf
+	// Forward stderr to the daemon log *and* sniff provider-level
+	// errors out of it so we can surface them in the task result.
+	// CodeBuddy's session/prompt still reports stopReason=end_turn when
+	// the underlying HTTP call to the LLM returns 4xx/5xx, so without
+	// this the daemon reports a misleading "empty output" and the
+	// actionable error (expired token, rate limit, upstream 5xx, …)
+	// stays buried in the daemon log.
+	//
+	// StderrPipe + an explicit copier give us a join point
+	// (`stderrDone`) that fires before the failure-promotion decision;
+	// see the matching comment in hermes.go for why the io.MultiWriter
+	// form races with stopReason=end_turn under load.
+	providerErr := newACPProviderErrorSniffer("codebuddy")
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("codebuddy stderr pipe: %w", err)
+	}
 
 	if err := cmd.Start(); err != nil {
-		closeStdin()
 		cancel()
 		return nil, fmt.Errorf("start codebuddy: %w", err)
 	}
 
-	b.cfg.Logger.Info("codebuddy started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+	stderrSink := io.MultiWriter(newLogWriter(b.cfg.Logger, "[codebuddy:stderr] "), providerErr)
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		_, _ = io.Copy(stderrSink, stderr)
+	}()
 
-	// cmd.Start() succeeded — transfer temp file ownership to the goroutine.
-	mcpFileCleanup = nil
+	b.cfg.Logger.Info("codebuddy acp started", "pid", cmd.Process.Pid, "cwd", opts.Cwd)
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
 
-	// Write the prompt in a dedicated goroutine to prevent deadlock.
-	// CodeBuddy (like Claude Code) emits a startup banner to stdout before
-	// reading stdin; a synchronous write would block once the pipe buffer
-	// fills. Keep stdin open after writing so control_request events can
-	// be answered mid-run.
-	writeDone := make(chan error, 1)
+	var outputMu sync.Mutex
+	var output strings.Builder
+
+	promptDone := make(chan hermesPromptResult, 1)
+
+	// Reuse the hermesClient ACP transport — CodeBuddy speaks the same protocol.
+	c := &hermesClient{
+		cfg:          b.cfg,
+		stdin:        stdin,
+		pending:      make(map[int]*pendingRPC),
+		pendingTools: make(map[string]*pendingToolCall),
+		onMessage: func(msg Message) {
+			// hermesClient.handleToolCallStart has already mapped the
+			// raw ACP title via hermesToolNameFromTitle — which covers
+			// lowercase hermes-style titles ("read:", "patch
+			// (replace)", …) but not capitalised CodeBuddy-style ones
+			// ("Read file: …", "Run command: …"). Re-normalise so the
+			// UI sees consistent snake_case identifiers across all
+			// backends. No-op when the name is already normal form.
+			if msg.Type == MessageToolUse {
+				msg.Tool = codebuddyToolNameFromTitle(msg.Tool)
+			}
+			if msg.Type == MessageText {
+				outputMu.Lock()
+				output.WriteString(msg.Content)
+				outputMu.Unlock()
+			}
+			trySend(msgCh, msg)
+		},
+		onPromptDone: func(result hermesPromptResult) {
+			select {
+			case promptDone <- result:
+			default:
+			}
+		},
+	}
+
+	// Start reading stdout in background.
+	readerDone := make(chan struct{})
 	go func() {
-		err := writeCodebuddyInput(stdin, prompt)
-		if err != nil {
-			closeStdin()
-		}
-		writeDone <- err
-	}()
-
-	go func() {
-		defer cancel()
-		defer close(msgCh)
-		defer close(resCh)
-		if mcpConfigPath != "" {
-			defer os.Remove(mcpConfigPath)
-		}
-
-		startTime := time.Now()
-		var output strings.Builder
-		var sessionID string
-		finalStatus := "completed"
-		var finalError string
-		usage := make(map[string]TokenUsage)
-
-		// Close stdout when the context is cancelled so scanner.Scan() unblocks.
-		go func() {
-			<-runCtx.Done()
-			closeStdin()
-			_ = stdout.Close()
-		}()
-
+		defer close(readerDone)
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
-
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
 				continue
 			}
+			c.handleLine(line)
+		}
+		c.closeAllPending(fmt.Errorf("codebuddy process exited"))
+	}()
 
-			var msg codebuddySDKMessage
-			if err := json.Unmarshal([]byte(line), &msg); err != nil {
-				continue
+	// Drive the ACP session lifecycle in a goroutine.
+	go func() {
+		defer cancel()
+		defer close(msgCh)
+		defer close(resCh)
+		defer func() {
+			stdin.Close()
+			_ = cmd.Wait()
+		}()
+
+		startTime := time.Now()
+		finalStatus := "completed"
+		var finalError string
+		var sessionID string
+
+		// 1. Initialize handshake.
+		initResult, err := c.request(runCtx, "initialize", map[string]any{
+			"protocolVersion": 1,
+			"clientInfo": map[string]any{
+				"name":    "multica-agent-sdk",
+				"version": "0.2.0",
+			},
+			"clientCapabilities": map[string]any{},
+		})
+		if err != nil {
+			finalStatus = "failed"
+			finalError = fmt.Sprintf("codebuddy initialize failed: %v", err)
+			resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
+			return
+		}
+
+		// Drop MCP entries whose remote transport the runtime didn't
+		// advertise. See the matching comment in hermes.go for the why —
+		// shipping an http/sse entry to a stdio-only runtime tanks the
+		// whole session/new.
+		mcpServers = filterACPMcpServersByCapability(mcpServers, extractACPMcpCapabilities(initResult), "codebuddy", b.cfg.Logger)
+
+		// 2. Create or resume a session.
+		cwd := opts.Cwd
+		if cwd == "" {
+			cwd = "."
+		}
+
+		if opts.ResumeSessionID != "" {
+			// Per ACP Session Setup, session/resume accepts mcpServers
+			// and the runtime re-connects them as part of the resume.
+			result, err := c.request(runCtx, "session/resume", map[string]any{
+				"cwd":        cwd,
+				"sessionId":  opts.ResumeSessionID,
+				"mcpServers": mcpServers,
+			})
+			if err != nil {
+				finalStatus = "failed"
+				finalError = fmt.Sprintf("codebuddy session/resume failed: %v", err)
+				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
+				return
 			}
-
-			switch msg.Type {
-			case "assistant":
-				b.handleAssistant(msg, msgCh, &output, usage)
-			case "user":
-				b.handleUser(msg, msgCh)
-			case "system":
-				if msg.SessionID != "" {
-					sessionID = msg.SessionID
-				}
-				trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
-			case "result":
-				sessionID = msg.SessionID
-				if msg.ResultText != "" {
-					output.Reset()
-					output.WriteString(msg.ResultText)
-				}
-				if resultUsage := codebuddyResultUsage(msg, opts.Model); len(resultUsage) > 0 {
-					usage = resultUsage
-				}
-				if msg.IsError {
-					finalStatus = "failed"
-					finalError = msg.ResultText
-				}
-				closeStdin()
-			case "log":
-				if msg.Log != nil {
-					trySend(msgCh, Message{
-						Type:    MessageLog,
-						Level:   msg.Log.Level,
-						Content: msg.Log.Message,
-					})
-				}
-			case "control_request":
-				b.handleControlRequest(msg, stdin)
+			var changed bool
+			sessionID, changed = resolveResumedSessionID(opts.ResumeSessionID, result)
+			if changed {
+				b.cfg.Logger.Warn("agent returned a different session id on resume — original was likely lost; continuing with the new id",
+					"backend", "codebuddy",
+					"requested", opts.ResumeSessionID,
+					"actual", sessionID,
+				)
+			}
+		} else {
+			result, err := c.request(runCtx, "session/new", map[string]any{
+				"cwd":        cwd,
+				"mcpServers": mcpServers,
+			})
+			if err != nil {
+				finalStatus = "failed"
+				finalError = fmt.Sprintf("codebuddy session/new failed: %v", err)
+				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
+				return
+			}
+			sessionID = extractACPSessionID(result)
+			if sessionID == "" {
+				finalStatus = "failed"
+				finalError = "codebuddy session/new returned no session ID"
+				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
+				return
 			}
 		}
 
-		closeStdin()
+		c.sessionID = sessionID
+		b.cfg.Logger.Info("codebuddy session created", "session_id", sessionID)
 
-		// Wait for process exit.
-		exitErr := cmd.Wait()
+		// 3. If the caller picked a model (via agent.model from the UI
+		// dropdown), ask codebuddy to switch the session to it before we
+		// send any prompt. CodeBuddy's ACP server exposes
+		// `session/set_model`; we pass the chosen modelId through
+		// verbatim. This MUST fail the task on error: silently falling
+		// back to codebuddy's default model would let the user believe
+		// their pick was honoured while the task actually ran on
+		// something else.
+		if opts.Model != "" {
+			if _, err := c.request(runCtx, "session/set_model", map[string]any{
+				"sessionId": sessionID,
+				"modelId":   opts.Model,
+			}); err != nil {
+				b.cfg.Logger.Warn("codebuddy set_session_model failed", "error", err, "requested_model", opts.Model)
+				finalStatus = "failed"
+				finalError = fmt.Sprintf("codebuddy could not switch to model %q: %v", opts.Model, err)
+				if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
+					// On a resumed session with a model override, the
+					// dead session surfaces here instead of at
+					// session/prompt. Same fix as the prompt path
+					// below: clear the id so the daemon's
+					// resume-failure fallback retries fresh.
+					b.cfg.Logger.Warn("resumed session not found at set_model time; clearing session id so the daemon retries fresh",
+						"backend", "codebuddy",
+						"session_id", sessionID,
+					)
+					sessionID = ""
+				}
+				resCh <- Result{
+					Status:     finalStatus,
+					Error:      finalError,
+					DurationMs: time.Since(startTime).Milliseconds(),
+					SessionID:  sessionID,
+				}
+				return
+			}
+			b.cfg.Logger.Info("codebuddy session model set", "model", opts.Model)
+		}
+
+		// 4. Send the prompt and wait for PromptResponse. SystemPrompt,
+		// if any, was already passed via --append-system-prompt at
+		// process launch — do NOT splice it into the user turn.
+		_, err = c.request(runCtx, "session/prompt", map[string]any{
+			"sessionId": sessionID,
+			"prompt": []map[string]any{
+				{"type": "text", "text": prompt},
+			},
+		})
+		if err != nil {
+			if runCtx.Err() == context.DeadlineExceeded {
+				finalStatus = "timeout"
+				finalError = fmt.Sprintf("codebuddy timed out after %s", timeout)
+			} else if runCtx.Err() == context.Canceled {
+				finalStatus = "aborted"
+				finalError = "execution cancelled"
+			} else {
+				finalStatus = "failed"
+				finalError = fmt.Sprintf("codebuddy session/prompt failed: %v", err)
+				if opts.ResumeSessionID != "" && isACPSessionNotFound(err) {
+					// The runtime echoes the requested id back from
+					// session/resume even when the session is gone, so
+					// the stale id only fails here, at prompt time.
+					// Empty SessionID lets the daemon's resume-failure
+					// fallback retry fresh and store the replacement id.
+					b.cfg.Logger.Warn("resumed session not found at prompt time; clearing session id so the daemon retries fresh",
+						"backend", "codebuddy",
+						"session_id", sessionID,
+					)
+					sessionID = ""
+				}
+			}
+		} else {
+			select {
+			case pr := <-promptDone:
+				if pr.stopReason == "cancelled" {
+					finalStatus = "aborted"
+					finalError = "codebuddy cancelled the prompt"
+				}
+				c.usageMu.Lock()
+				c.usage.InputTokens += pr.usage.InputTokens
+				c.usage.OutputTokens += pr.usage.OutputTokens
+				c.usageMu.Unlock()
+			default:
+			}
+		}
+
 		duration := time.Since(startTime)
-		// writeDone is buffered (cap 1) and the writer always sends — by the
-		// time cmd has exited, the prompt write has either succeeded, hit a
-		// broken pipe, or been unblocked by the kill that ended cmd.
-		writeErr := <-writeDone
-
-		switch {
-		case runCtx.Err() == context.DeadlineExceeded:
-			finalStatus = "timeout"
-			finalError = fmt.Sprintf("codebuddy timed out after %s", timeout)
-		case runCtx.Err() == context.Canceled:
-			finalStatus = "aborted"
-			finalError = "execution cancelled"
-		case writeErr != nil && finalStatus == "completed" && sessionID == "":
-			// No result event landed and the prompt write failed — codebuddy
-			// died before reading the prompt. Surface the write error; the
-			// stderr tail attached below carries the real reason.
-			finalStatus = "failed"
-			finalError = fmt.Sprintf("write codebuddy input: %v", writeErr)
-		case exitErr != nil && finalStatus == "completed":
-			finalStatus = "failed"
-			finalError = fmt.Sprintf("codebuddy exited with error: %v", exitErr)
-		}
-
-		if finalError != "" {
-			finalError = withAgentStderr(finalError, "codebuddy", stderrBuf.Tail())
-		}
-
 		b.cfg.Logger.Info("codebuddy finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
 
-		reportedSessionID := resolveSessionID(opts.ResumeSessionID, sessionID, finalStatus == "failed")
-		if reportedSessionID != sessionID {
-			b.cfg.Logger.Info("codebuddy resume did not land; clearing fresh session id for daemon fallback",
-				"requested_resume", opts.ResumeSessionID,
-				"emitted_session", sessionID,
-			)
+		stdin.Close()
+		cancel()
+
+		<-readerDone
+		// Ensure the stderr copier has drained before consulting the
+		// provider-error sniffer; see hermes.go for the failure mode.
+		<-stderrDone
+
+		outputMu.Lock()
+		finalOutput := output.String()
+		outputMu.Unlock()
+
+		// Promote completed→failed when stderr or the agent text stream
+		// show a terminal upstream-LLM failure (HTTP 4xx / rate-limit /
+		// expired token). See the helper docs for the full signal set;
+		// the key safety property is that transient per-attempt
+		// warnings followed by a successful retry stay "completed".
+		finalStatus, finalError = promoteACPResultOnProviderError(finalStatus, finalError, finalOutput, providerErr)
+
+		c.usageMu.Lock()
+		u := c.usage
+		c.usageMu.Unlock()
+
+		var usageMap map[string]TokenUsage
+		if u.InputTokens > 0 || u.OutputTokens > 0 || u.CacheReadTokens > 0 {
+			model := opts.Model
+			if model == "" {
+				model = "unknown"
+			}
+			usageMap = map[string]TokenUsage{model: u}
 		}
 
 		resCh <- Result{
 			Status:     finalStatus,
-			Output:     output.String(),
+			Output:     finalOutput,
 			Error:      finalError,
 			DurationMs: duration.Milliseconds(),
-			SessionID:  reportedSessionID,
-			Usage:      usage,
+			SessionID:  sessionID,
+			Usage:      usageMap,
 		}
 	}()
 
 	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
-func (b *codebuddyBackend) handleAssistant(msg codebuddySDKMessage, ch chan<- Message, output *strings.Builder, usage map[string]TokenUsage) {
-	var content codebuddyMessageContent
-	if err := json.Unmarshal(msg.Message, &content); err != nil {
-		return
+// codebuddyToolNameFromTitle normalises tool names emitted by CodeBuddy's
+// ACP server into the snake_case identifiers the Multica UI expects.
+//
+// CodeBuddy (a Claude Code fork) follows the ACP spec where `title` is a
+// short human-readable label such as "Read file: /path/to/foo.go" or
+// "Run command: ls". hermesToolNameFromTitle upstream handles hermes'
+// lowercase convention ("read:", "patch (replace)") but not CodeBuddy's
+// capitalised format — so we get called on the already-mapped name from
+// hermes and fix up anything that slipped through. Empty input returns "".
+func codebuddyToolNameFromTitle(title string) string {
+	t := strings.TrimSpace(title)
+	if t == "" {
+		return ""
 	}
 
-	// Accumulate token usage per model.
-	if content.Usage != nil && content.Model != "" {
-		u := usage[content.Model]
-		u.InputTokens += content.Usage.InputTokens
-		u.OutputTokens += content.Usage.OutputTokens
-		u.CacheReadTokens += content.Usage.CacheReadInputTokens
-		u.CacheWriteTokens += content.Usage.CacheCreationInputTokens
-		usage[content.Model] = u
+	// Strip everything after the first colon — ACP titles often look like
+	// "Tool Name: argument detail" and we want only the tool name.
+	if idx := strings.Index(t, ":"); idx > 0 {
+		t = strings.TrimSpace(t[:idx])
 	}
 
-	for _, block := range content.Content {
-		switch block.Type {
-		case "text":
-			if block.Text != "" {
-				output.WriteString(block.Text)
-				trySend(ch, Message{Type: MessageText, Content: block.Text})
-			}
-		case "thinking":
-			if block.Text != "" {
-				trySend(ch, Message{Type: MessageThinking, Content: block.Text})
-			}
-		case "tool_use":
-			var input map[string]any
-			if block.Input != nil {
-				_ = json.Unmarshal(block.Input, &input)
-			}
-			trySend(ch, Message{
-				Type:   MessageToolUse,
-				Tool:   block.Name,
-				CallID: block.ID,
-				Input:  input,
-			})
-		}
-	}
-}
-
-func (b *codebuddyBackend) handleUser(msg codebuddySDKMessage, ch chan<- Message) {
-	var content codebuddyMessageContent
-	if err := json.Unmarshal(msg.Message, &content); err != nil {
-		return
+	lower := strings.ToLower(t)
+	switch lower {
+	case "read", "read file":
+		return "read_file"
+	case "write", "write file":
+		return "write_file"
+	case "edit", "patch":
+		return "edit_file"
+	case "shell", "bash", "terminal", "run command", "run shell command":
+		return "terminal"
+	case "search", "grep", "find":
+		return "search_files"
+	case "glob":
+		return "glob"
+	case "web search":
+		return "web_search"
+	case "fetch", "web fetch":
+		return "web_fetch"
+	case "todo", "todo write":
+		return "todo_write"
 	}
 
-	for _, block := range content.Content {
-		if block.Type == "tool_result" {
-			resultStr := ""
-			if block.Content != nil {
-				resultStr = string(block.Content)
-			}
-			trySend(ch, Message{
-				Type:   MessageToolResult,
-				CallID: block.ToolUseID,
-				Output: resultStr,
-			})
-		}
-	}
-}
-
-func (b *codebuddyBackend) handleControlRequest(msg codebuddySDKMessage, stdin interface{ Write([]byte) (int, error) }) {
-	// Auto-approve all tool uses in autonomous/daemon mode.
-	var req codebuddyControlRequestPayload
-	if err := json.Unmarshal(msg.Request, &req); err != nil {
-		return
-	}
-
-	var inputMap map[string]any
-	if req.Input != nil {
-		_ = json.Unmarshal(req.Input, &inputMap)
-	}
-	if inputMap == nil {
-		inputMap = map[string]any{}
-	}
-
-	response := map[string]any{
-		"type": "control_response",
-		"response": map[string]any{
-			"subtype":    "success",
-			"request_id": msg.RequestID,
-			"response": map[string]any{
-				"behavior":     "allow",
-				"updatedInput": inputMap,
-			},
-		},
-	}
-
-	data, err := json.Marshal(response)
-	if err != nil {
-		b.cfg.Logger.Warn("codebuddy: failed to marshal control response", "error", err)
-		return
-	}
-	data = append(data, '\n')
-	if _, err := stdin.Write(data); err != nil {
-		b.cfg.Logger.Warn("codebuddy: failed to write control response", "error", err)
-	}
-}
-
-func writeCodebuddyInput(w io.Writer, prompt string) error {
-	payload := map[string]any{
-		"type": "user",
-		"message": map[string]any{
-			"role": "user",
-			"content": []map[string]string{
-				{
-					"type": "text",
-					"text": prompt,
-				},
-			},
-		},
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal codebuddy input: %w", err)
-	}
-	data = append(data, '\n')
-	if _, err := w.Write(data); err != nil {
-		return err
-	}
-	return nil
-}
-
-// ── Codebuddy SDK JSON types ──
-
-type codebuddySDKMessage struct {
-	Type      string          `json:"type"`
-	Message   json.RawMessage `json:"message,omitempty"`
-	Subtype   string          `json:"subtype,omitempty"`
-	SessionID string          `json:"session_id,omitempty"`
-	Model     string          `json:"model,omitempty"`
-
-	// result fields
-	ResultText string                               `json:"result,omitempty"`
-	IsError    bool                                  `json:"is_error,omitempty"`
-	DurationMs float64                              `json:"duration_ms,omitempty"`
-	NumTurns   int                                  `json:"num_turns,omitempty"`
-	Usage      *codebuddyUsage                      `json:"usage,omitempty"`
-	ModelUsage map[string]codebuddyResultModelUsage `json:"modelUsage,omitempty"`
-
-	// log fields
-	Log *codebuddyLogEntry `json:"log,omitempty"`
-
-	// control request fields
-	RequestID string          `json:"request_id,omitempty"`
-	Request   json.RawMessage `json:"request,omitempty"`
-}
-
-type codebuddyLogEntry struct {
-	Level   string `json:"level"`
-	Message string `json:"message"`
-}
-
-type codebuddyMessageContent struct {
-	Role    string                  `json:"role"`
-	Model   string                  `json:"model"`
-	Content []codebuddyContentBlock `json:"content"`
-	Usage   *codebuddyUsage         `json:"usage,omitempty"`
-}
-
-type codebuddyUsage struct {
-	InputTokens              int64 `json:"input_tokens"`
-	OutputTokens             int64 `json:"output_tokens"`
-	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
-	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
-}
-
-type codebuddyResultModelUsage struct {
-	InputTokens              int64 `json:"inputTokens"`
-	OutputTokens             int64 `json:"outputTokens"`
-	CacheReadInputTokens     int64 `json:"cacheReadInputTokens"`
-	CacheCreationInputTokens int64 `json:"cacheCreationInputTokens"`
-}
-
-type codebuddyContentBlock struct {
-	Type      string          `json:"type"`
-	Text      string          `json:"text,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Input     json.RawMessage `json:"input,omitempty"`
-	ToolUseID string          `json:"tool_use_id,omitempty"`
-	Content   json.RawMessage `json:"content,omitempty"`
-}
-
-type codebuddyControlRequestPayload struct {
-	Subtype  string          `json:"subtype"`
-	ToolName string          `json:"tool_name,omitempty"`
-	Input    json.RawMessage `json:"input,omitempty"`
-}
-
-func codebuddyResultUsage(msg codebuddySDKMessage, fallbackModel string) map[string]TokenUsage {
-	if len(msg.ModelUsage) > 0 {
-		usage := make(map[string]TokenUsage, len(msg.ModelUsage))
-		for model, u := range msg.ModelUsage {
-			if model == "" || !codebuddyUsageHasTokens(u.InputTokens, u.OutputTokens, u.CacheReadInputTokens, u.CacheCreationInputTokens) {
-				continue
-			}
-			usage[model] = TokenUsage{
-				InputTokens:      u.InputTokens,
-				OutputTokens:     u.OutputTokens,
-				CacheReadTokens:  u.CacheReadInputTokens,
-				CacheWriteTokens: u.CacheCreationInputTokens,
-			}
-		}
-		if len(usage) > 0 {
-			return usage
-		}
-	}
-
-	model := msg.Model
-	if model == "" {
-		model = fallbackModel
-	}
-	if msg.Usage == nil || model == "" || !codebuddyUsageHasTokens(
-		msg.Usage.InputTokens,
-		msg.Usage.OutputTokens,
-		msg.Usage.CacheReadInputTokens,
-		msg.Usage.CacheCreationInputTokens,
-	) {
-		return nil
-	}
-	return map[string]TokenUsage{
-		model: {
-			InputTokens:      msg.Usage.InputTokens,
-			OutputTokens:     msg.Usage.OutputTokens,
-			CacheReadTokens:  msg.Usage.CacheReadInputTokens,
-			CacheWriteTokens: msg.Usage.CacheCreationInputTokens,
-		},
-	}
-}
-
-func codebuddyUsageHasTokens(input, output, cacheRead, cacheWrite int64) bool {
-	return input > 0 || output > 0 || cacheRead > 0 || cacheWrite > 0
+	// Fallback: snake_case the title so the UI gets a stable identifier.
+	return strings.ReplaceAll(lower, " ", "_")
 }
