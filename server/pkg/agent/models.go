@@ -1368,10 +1368,15 @@ func isOpenclawIdentifier(s string) bool {
 // line in `codebuddy --help` output.
 var codebuddyModelRe = regexp.MustCompile(`--model\s*<[^>]+>\s*.*?Currently supported:\s*\(([^)]+)\)`)
 
-// discoverCodebuddyModels runs `codebuddy --help` and extracts the
-// supported model list from its output. Falls back to a static list
-// when the binary is missing or the output cannot be parsed.
+// discoverCodebuddyModels 优先通过 CLI 控制请求（get_available_models）
+// 获取真实模型列表；失败时回退到 `codebuddy --help` 正则解析；
+// 再失败时回退到静态列表。
 func discoverCodebuddyModels(ctx context.Context, executablePath string) ([]Model, error) {
+	// 优先通过 CLI 控制请求获取真实模型列表
+	if models, err := discoverCodebuddyModelsViaSDK(ctx, executablePath); err == nil && len(models) > 0 {
+		return models, nil
+	}
+	// SDK 失败 → 回退到 --help 解析
 	if executablePath == "" {
 		executablePath = "codebuddy"
 	}

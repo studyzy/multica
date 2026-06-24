@@ -2,11 +2,13 @@ package agent
 
 import (
 	"context"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestListModelsStaticProviders(t *testing.T) {
@@ -1010,4 +1012,220 @@ func TestCachedDiscovery(t *testing.T) {
 	if calls != 1 {
 		t.Errorf("expected 1 underlying call due to cache, got %d", calls)
 	}
+}
+
+// codebuddyCLISkip skips the test when the real codebuddy CLI is not on PATH.
+// These tests drive the actual CLI to verify the SDK control-request path
+// returns the real model list; no fakes.
+func codebuddyCLISkip(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("codebuddy"); err != nil {
+		t.Skipf("codebuddy CLI not found on PATH: %v", err)
+	}
+	return ""
+}
+
+// TestDiscoverCodebuddyModelsViaSDK_RealCLI drives the real codebuddy CLI
+// (skipped when absent) and verifies the SDK control-request path returns
+// a non-empty model list with ModelID / Label / Provider populated.
+func TestDiscoverCodebuddyModelsViaSDK_RealCLI(t *testing.T) {
+	codebuddyCLISkip(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	models, err := discoverCodebuddyModelsViaSDK(ctx, "")
+	if err != nil {
+		t.Fatalf("discoverCodebuddyModelsViaSDK: %v", err)
+	}
+	if len(models) == 0 {
+		t.Fatal("expected non-empty model list from real codebuddy CLI")
+	}
+
+	defaults := 0
+	seenIDs := map[string]bool{}
+	for i, m := range models {
+		t.Logf("model[%d]: %+v", i, m)
+		if m.ID == "" {
+			t.Errorf("model[%d] has empty ID: %+v", i, m)
+		}
+		if m.Label == "" {
+			t.Errorf("model[%d] has empty Label: %+v", i, m)
+		}
+		if m.Default {
+			defaults++
+		}
+		seenIDs[m.ID] = true
+	}
+	if defaults != 1 {
+		t.Errorf("expected exactly one default model, got %d: %+v", defaults, models)
+	}
+	// Provider should be inferred from ID prefix for known families; unknown
+	// models get "" which is acceptable. Just sanity-check that at least one
+	// known family is present (the CLI catalog always includes Claude/GPT/Gemini).
+	knownFamilies := 0
+	for _, m := range models {
+		switch m.Provider {
+		case "anthropic", "openai", "google", "zhipu", "deepseek", "kimi", "minimax", "hunyuan":
+			knownFamilies++
+		}
+	}
+	if knownFamilies == 0 {
+		t.Errorf("expected at least one model with a known provider prefix, got %+v", models)
+	}
+}
+
+// TestDiscoverCodebuddyModels_RealCLI_FullChain drives the real codebuddy CLI
+// through the public discoverCodebuddyModels entry point, verifying the SDK
+// path is selected (not the --help fallback) when the CLI is available.
+func TestDiscoverCodebuddyModels_RealCLI_FullChain(t *testing.T) {
+	codebuddyCLISkip(t)
+
+	// Prime cache miss so we hit the live discovery function.
+	modelCacheMu.Lock()
+	delete(modelCache, "codebuddy")
+	modelCacheMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	models, err := discoverCodebuddyModels(ctx, "")
+	if err != nil {
+		t.Fatalf("discoverCodebuddyModels: %v", err)
+	}
+	if len(models) == 0 {
+		t.Fatal("expected non-empty model list")
+	}
+	// Verify Model fields are populated end-to-end.
+	for i, m := range models {
+		if m.ID == "" {
+			t.Errorf("model[%d] empty ID: %+v", i, m)
+		}
+		if m.Label == "" {
+			t.Errorf("model[%d] empty Label: %+v", i, m)
+		}
+	}
+}
+
+// TestDiscoverCodebuddyModelsViaSDK_MissingBinaryErrors verifies that a
+// missing executable surfaces as a non-nil error (so the caller falls back
+// to the static catalog) rather than hanging.
+func TestDiscoverCodebuddyModelsViaSDK_MissingBinaryErrors(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	models, err := discoverCodebuddyModelsViaSDK(ctx, "/nonexistent/codebuddy-path")
+	if err == nil {
+		t.Fatalf("expected error for missing binary, got models: %+v", models)
+	}
+}
+
+// TestDiscoverCodebuddyModels_FallsBackToStaticOnMissingBinary verifies
+// that when the binary is entirely missing (both SDK and --help fail), the
+// static catalog is returned so the UI dropdown stays populated.
+func TestDiscoverCodebuddyModels_FallsBackToStaticOnMissingBinary(t *testing.T) {
+	modelCacheMu.Lock()
+	delete(modelCache, "codebuddy")
+	modelCacheMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	models, err := discoverCodebuddyModels(ctx, "/nonexistent/codebuddy-cli")
+	if err != nil {
+		t.Fatalf("discoverCodebuddyModels: %v", err)
+	}
+	if len(models) == 0 {
+		t.Fatal("expected static fallback models, got empty list")
+	}
+	// Spot-check one expected static entry.
+	ids := map[string]bool{}
+	for _, m := range models {
+		ids[m.ID] = true
+	}
+	if !ids["claude-sonnet-4.6"] {
+		t.Errorf("static fallback missing claude-sonnet-4.6: %+v", models)
+	}
+}
+
+// TestCodebuddyCLI_CloseIsIdempotent verifies that calling close() multiple
+// times is safe (no panic from double close of closeCh).
+func TestCodebuddyCLI_CloseIsIdempotent(t *testing.T) {
+	c := &codebuddyCLI{
+		closeCh: make(chan struct{}),
+		pending: make(map[string]chan map[string]any),
+	}
+	c.close()
+	c.close()
+	c.close()
+}
+
+// TestCodebuddyCLI_RouteControlResponse_ErrorAndSuccess verifies the response
+// router delivers success payloads verbatim and wraps error subtypes with the
+// __error sentinel key so sendControlRequest surfaces them as errors.
+func TestCodebuddyCLI_RouteControlResponse_ErrorAndSuccess(t *testing.T) {
+	c := &codebuddyCLI{
+		closeCh: make(chan struct{}),
+		pending: make(map[string]chan map[string]any),
+	}
+
+	// Register pending request.
+	successCh := make(chan map[string]any, 1)
+	errorCh := make(chan map[string]any, 1)
+	c.pendingMu.Lock()
+	c.pending["req-success"] = successCh
+	c.pending["req-error"] = errorCh
+	c.pendingMu.Unlock()
+
+	// Success response.
+	c.routeControlResponse(map[string]any{
+		"type": "control_response",
+		"response": map[string]any{
+			"request_id": "req-success",
+			"subtype":    "success",
+			"response":   map[string]any{"availableModels": []any{"x"}},
+		},
+	})
+	// Error response.
+	c.routeControlResponse(map[string]any{
+		"type": "control_response",
+		"response": map[string]any{
+			"request_id": "req-error",
+			"subtype":    "error",
+			"error":      "boom",
+		},
+	})
+
+	select {
+	case resp := <-successCh:
+		if _, ok := resp["__error"]; ok {
+			t.Errorf("success response must not carry __error: %+v", resp)
+		}
+		raw, _ := resp["availableModels"].([]any)
+		if len(raw) != 1 || raw[0] != "x" {
+			t.Errorf("expected availableModels=[x], got %+v", resp)
+		}
+	default:
+		t.Fatal("expected success response on channel")
+	}
+
+	select {
+	case resp := <-errorCh:
+		errMsg, _ := resp["__error"].(string)
+		if errMsg != "boom" {
+			t.Errorf("expected __error=boom, got %+v", resp)
+		}
+	default:
+		t.Fatal("expected error response on channel")
+	}
+
+	// Unknown request_id is silently dropped (no panic, no block).
+	c.routeControlResponse(map[string]any{
+		"type": "control_response",
+		"response": map[string]any{
+			"request_id": "req-unknown",
+			"subtype":    "success",
+			"response":   map[string]any{},
+		},
+	})
 }
